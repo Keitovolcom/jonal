@@ -110,3 +110,48 @@ W&Bには各エポックの8指標と実験設定を記録し、ソースコー�
 `is_noisy` は、学習用ラベルが元ラベルから実際に変化した場合だけ `True` です。
 全訓練指標と noisy/clean の部分集合指標は学習用ラベルに対して計算され、
 該当サンプルが0件の部分集合は `NaN` として記録されます。
+
+## 補間実験（空間・時間的不安定性）
+
+`train.py` が保存したチェックポイントを使い、2サンプル `x0`, `x1` を結ぶ直線
+`x(α) = (1 − α)x0 + αx1`（α = −0.5〜1.5、刻み0.01、201点）上で推論します。
+チェックポイントは `--checkpoint-interval` で保存されたものをすべて使い、
+`checkpoint/epoch_0.pt` があれば初期モデルも含めます。
+
+```bash
+# 3モードの推論と定量化・描画をまとめて実行
+RUN_DIR=results/<experiment_name> NUM_PAIRS=1000 GPU=0 PHASE_EPOCHS='30,60' \
+  bash interpolation.bash
+
+# 個別に実行する場合
+python3 interpolation.py --run-dir results/<experiment_name> --mode clean-noisy --num-pairs 1000
+python3 interpolation_metrics.py --mode-dir interpolation/<experiment_name>/clean-noisy
+```
+
+ペアの作り方（距離は正規化後の入力空間でのL2、データ拡張なし）:
+
+- `clean-clean`: cleanサンプルを `x0` とし、同じラベルのclean最近傍を `x1`
+- `clean-noisy`: noisyサンプルを `x0`（クエリ）とし、その元ラベルと同じclean最近傍を `x1`
+- `test-test`: テストサンプルを `x0` とし、同じラベルのテスト最近傍を `x1`
+
+クエリは `--pair-seed` で再現可能に重複なく選びます。出力構成:
+
+```
+interpolation/<experiment_name>/<mode>/
+├── config.json            # 実行条件・α・エポック一覧
+├── pairs.json             # 全ペアのインデックス・ラベル・距離
+├── pair_0000/log.npz      # 1ペアの全結果
+├── ...
+└── metrics/
+    ├── spatial_instability.csv / spatial_instability_per_pair.npz   # INST_S
+    ├── temporal_instability.csv / temporal_instability.npz          # INST_T [epoch, α]
+    ├── occupancy.csv                                                # original/noisy/other占有率
+    └── figures/{spatial_instability,temporal_instability_heatmap,occupancy}.pdf
+```
+
+`log.npz` には `probs`（[エポック, 201, クラス] のsoftmax確率、float32）、
+`preds`（[エポック, 201] の予測ラベル）、`epochs`、`alphas`、`distance`、
+`x0_*`/`x1_*`（`split`、`index`、`original_label`、`training_label`、`is_noisy`）を保存します。
+完了済みの `log.npz` があるペアは再実行時にスキップされます。
+メモリ使用量は `--pairs-per-chunk`（既定100）で調整できます。
+INST_T の「t−1」は直前に評価したチェックポイントで、最初のエポックは `NaN` です。
