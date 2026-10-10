@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
 
@@ -38,10 +39,53 @@ _CONFIG = {
     },
     "emnist-digits": {
         "num_classes": 10,
-        "mean": (0.1307,),
-        "std": (0.3081,),
+        "mean": (0.173469787916794,),
+        "std": (0.316553955125998,),
     },
 }
+
+
+class LabelNoiseDataset(Dataset):
+    """Training dataset retaining both original and learning labels.
+
+    Each item is ``(image, original_label, training_label, is_noisy)``.
+    ``targets`` remains an alias for the learning labels so utilities expecting
+    a torchvision-style dataset continue to work.
+    """
+
+    def __init__(self, dataset: Dataset, training_targets: Any):
+        if not hasattr(dataset, "targets"):
+            raise TypeError("The wrapped dataset must expose a 'targets' attribute")
+        original = _targets_as_numpy(dataset.targets)
+        training = _targets_as_numpy(training_targets)
+        if original.shape != training.shape:
+            raise ValueError("original and training labels must have the same shape")
+
+        self.dataset = dataset
+        self.original_targets = torch.as_tensor(original, dtype=torch.long)
+        self.training_targets = torch.as_tensor(training, dtype=torch.long)
+        self.is_noisy = self.original_targets.ne(self.training_targets)
+        self.targets = self.training_targets
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        sample = self.dataset[index]
+        image = sample[0]
+        return (
+            image,
+            self.original_targets[index],
+            self.training_targets[index],
+            self.is_noisy[index],
+        )
+
+    def __getattr__(self, name: str):
+        # Keep useful torchvision attributes such as classes and transform.
+        if name == "dataset":
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
+
 
 
 def _canonical_name(dataset_name: str) -> str:
@@ -202,7 +246,7 @@ def _create_augmentation(
     parameters: dict[str, Any],
     dataset_name: str,
 ):
-    image_size = 28 if dataset_name == "emnist-digits" else 32
+    image_size = 32
     kwargs = dict(parameters)
     try:
         if name == "random_crop":
@@ -248,12 +292,19 @@ def _create_augmentation(
 def build_transforms(
     dataset_name: str,
     augment: bool | str | Mapping[str, Any] | Sequence[Any] | None = False,
+    input_channels: int | None = None,
 ):
-    """Build transforms with mandatory normalization for both data splits."""
+    """Build transforms with mandatory resize/normalization for both splits."""
 
     name = _canonical_name(dataset_name)
     config = _CONFIG[name]
-    before_tensor: list[Any] = []
+    native_channels = len(config["mean"])
+    channels = native_channels if input_channels is None else input_channels
+    if channels not in (1, 3):
+        raise ValueError("input_channels must be 1 or 3 for the supported datasets")
+
+    resize = [transforms.Resize((32, 32))] if name == "emnist-digits" else []
+    before_tensor: list[Any] = list(resize)
     after_normalization: list[Any] = []
     for augmentation_name, parameters in _resolve_augmentations(name, augment):
         augmentation = _create_augmentation(
@@ -264,14 +315,27 @@ def build_transforms(
         else:
             before_tensor.append(augmentation)
 
-    normalization = transforms.Normalize(config["mean"], config["std"])
+    if channels != native_channels:
+        before_tensor.append(transforms.Grayscale(num_output_channels=channels))
+    if channels == native_channels:
+        mean, std = config["mean"], config["std"]
+    elif channels == 1:
+        mean, std = (float(np.mean(config["mean"])),), (float(np.mean(config["std"])),)
+    else:
+        mean, std = tuple(config["mean"] * 3), tuple(config["std"] * 3)
+    normalization = transforms.Normalize(mean, std)
     train_transform = transforms.Compose(
         before_tensor
         + [transforms.ToTensor(), normalization]
         + after_normalization
     )
+    evaluation_before_tensor = list(resize)
+    if channels != native_channels:
+        evaluation_before_tensor.append(
+            transforms.Grayscale(num_output_channels=channels)
+        )
     evaluation_transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize(config["mean"], config["std"])]
+        evaluation_before_tensor + [transforms.ToTensor(), normalization]
     )
     return train_transform, evaluation_transform
 
@@ -340,7 +404,10 @@ def label_cache_path(
 
     name = _canonical_name(dataset_name)
     root = DATA_DIR if data_dir is None else Path(data_dir)
-    return root / f"{name}_labels_noise-{_rate_token(noise_rate)}_seed-{seed}.npz"
+    dataset_root = root / name.replace("-", "_")
+    return dataset_root / (
+        f"{name}_labels_noise-{_rate_token(noise_rate)}_seed-{seed}.npz"
+    )
 
 
 def _load_cache(
@@ -421,8 +488,8 @@ def add_label_noise(
     seed: int = 0,
     num_classes: int | None = None,
     data_dir: str | Path | None = None,
-) -> Any:
-    """Apply cached or newly generated noise to a training dataset in place."""
+) -> LabelNoiseDataset:
+    """Return a dataset retaining original, learning, and noise labels."""
 
     name = _canonical_name(dataset_name)
     if not 0.0 <= noise_rate <= 1.0:
@@ -442,8 +509,7 @@ def add_label_noise(
             path, noisy, clean, name, noise_rate, seed, num_classes
         )
 
-    _set_targets(train_dataset, noisy)
-    return train_dataset
+    return LabelNoiseDataset(train_dataset, noisy)
 
 
 def load_dataset(
@@ -452,6 +518,7 @@ def load_dataset(
     data_augmentation: bool | str | Mapping[str, Any] | Sequence[Any] | None = False,
     label_noise_rate: float = 0.0,
     seed: int = 0,
+    input_channels: int | None = None,
     data_dir: str | Path | None = None,
     download: bool = True,
 ):
@@ -468,7 +535,7 @@ def load_dataset(
     root = DATA_DIR if data_dir is None else Path(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     train_transform, evaluation_transform = build_transforms(
-        name, augment=data_augmentation
+        name, augment=data_augmentation, input_channels=input_channels
     )
     dataset_root = root / name.replace("-", "_")
 
@@ -491,9 +558,10 @@ def load_dataset(
             root=dataset_root, train=False, download=download,
             transform=evaluation_transform,
         )
+    clean_targets = _targets_as_numpy(train_dataset.targets)
 
     if label_noise_rate > 0.0:
-        add_label_noise(
+        train_dataset = add_label_noise(
             train_dataset,
             label_noise_rate,
             dataset_name=name,
@@ -501,6 +569,9 @@ def load_dataset(
             num_classes=int(_CONFIG[name]["num_classes"]),
             data_dir=root,
         )
+    else:
+        # Always use the same item format, including the zero-noise case.
+        train_dataset = LabelNoiseDataset(train_dataset, clean_targets)
     return train_dataset, evaluation_dataset
 
 
@@ -518,3 +589,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "DATA_DIR",
+    "LabelNoiseDataset",
+    "SUPPORTED_AUGMENTATIONS",
+    "add_label_noise",
+    "build_transforms",
+    "generate_noisy_labels",
+    "label_cache_path",
+    "load_dataset",
+]

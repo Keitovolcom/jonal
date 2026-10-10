@@ -21,6 +21,20 @@ def _positive_int(name, value):
     return int(value)
 
 
+def _scaled_channels(width_multiplier, bases=(64, 128, 256, 512)):
+    if (isinstance(width_multiplier, bool)
+            or not isinstance(width_multiplier, Real)
+            or not math.isfinite(width_multiplier) or width_multiplier <= 0):
+        raise ValueError("width_multiplier must be finite and positive")
+    channels = []
+    for base in bases:
+        scaled = base * width_multiplier
+        if scaled < 1 or not float(scaled).is_integer():
+            raise ValueError("width_multiplier must produce positive integer channels")
+        channels.append(int(scaled))
+    return channels
+
+
 class CNN5Layer(nn.Module):
     """Five convolution/ReLU layers with pooling after layers 1, 2 and 4.
 
@@ -41,16 +55,7 @@ class CNN5Layer(nn.Module):
         height, width = (_positive_int("input_size", size) for size in input_size)
         if min(height, width) < 8:
             raise ValueError("Both input dimensions must be at least 8")
-        if (isinstance(width_multiplier, bool)
-                or not isinstance(width_multiplier, Real)
-                or not math.isfinite(width_multiplier) or width_multiplier <= 0):
-            raise ValueError("width_multiplier must be finite and positive")
-        channels = []
-        for base in (64, 128, 256, 512, 1024):
-            scaled = base * width_multiplier
-            if not math.isfinite(scaled) or scaled < 1 or not float(scaled).is_integer():
-                raise ValueError("width_multiplier must produce positive integer channels")
-            channels.append(int(scaled))
+        channels = _scaled_channels(width_multiplier, (64, 128, 256, 512, 1024))
         layers = []
         previous = in_channels
         for index, current in enumerate(channels, start=1):
@@ -100,20 +105,21 @@ class ResNet18(nn.Module):
     Intended for 32x32 images; adaptive pooling also supports other sizes.
     """
 
-    def __init__(self, in_channels=3, num_classes=10):
+    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0):
         super().__init__()
         self.in_channels = _positive_int("in_channels", in_channels)
         num_classes = _positive_int("num_classes", num_classes)
-        self.conv1 = nn.Conv2d(self.in_channels, 64, 3, stride=1,
+        c1, c2, c3, c4 = _scaled_channels(width_multiplier)
+        self.conv1 = nn.Conv2d(self.in_channels, c1, 3, stride=1,
                                padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
+        self.bn1 = nn.BatchNorm2d(c1)
         self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._stage(64, 64, stride=1)
-        self.layer2 = self._stage(64, 128, stride=2)
-        self.layer3 = self._stage(128, 256, stride=2)
-        self.layer4 = self._stage(256, 512, stride=2)
+        self.layer1 = self._stage(c1, c1, stride=1)
+        self.layer2 = self._stage(c1, c2, stride=2)
+        self.layer3 = self._stage(c2, c3, stride=2)
+        self.layer4 = self._stage(c3, c4, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, num_classes)
+        self.fc = nn.Linear(c4, num_classes)
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
@@ -169,19 +175,20 @@ class PreActResNet18(nn.Module):
     Defaults to RGB 32x32 images and 10 classes; other spatial sizes work too.
     """
 
-    def __init__(self, in_channels=3, num_classes=10):
+    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0):
         super().__init__()
         self.in_channels = _positive_int("in_channels", in_channels)
         num_classes = _positive_int("num_classes", num_classes)
-        self.conv1 = nn.Conv2d(self.in_channels, 64, 3, padding=1, bias=False)
-        self.layer1 = self._stage(64, 64, stride=1)
-        self.layer2 = self._stage(64, 128, stride=2)
-        self.layer3 = self._stage(128, 256, stride=2)
-        self.layer4 = self._stage(256, 512, stride=2)
-        self.bn = nn.BatchNorm2d(512)
+        c1, c2, c3, c4 = _scaled_channels(width_multiplier)
+        self.conv1 = nn.Conv2d(self.in_channels, c1, 3, padding=1, bias=False)
+        self.layer1 = self._stage(c1, c1, stride=1)
+        self.layer2 = self._stage(c1, c2, stride=2)
+        self.layer3 = self._stage(c2, c3, stride=2)
+        self.layer4 = self._stage(c3, c4, stride=2)
+        self.bn = nn.BatchNorm2d(c4)
         self.relu = nn.ReLU(inplace=True)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, num_classes)
+        self.fc = nn.Linear(c4, num_classes)
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
