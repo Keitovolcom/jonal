@@ -2,3 +2,4 @@ data/
 results/
 ._pycache_/
 interpolation/
+toy2d/
