@@ -19,13 +19,14 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset import load_dataset
-from model import MODEL_REGISTRY, create_model
+from model import MODEL_REGISTRY, RESNET_INITS, create_model
 
 
 DATASET_SPECS = {
     "cifar10": {"num_classes": 10, "input_size": 32, "input_channels": 3},
     "cifar100": {"num_classes": 100, "input_size": 32, "input_channels": 3},
     "emnist-digits": {"num_classes": 10, "input_size": 32, "input_channels": 1},
+    "mnist": {"num_classes": 10, "input_size": 28, "input_channels": 1},
 }
 METRIC_NAMES = (
     "test_error",
@@ -141,6 +142,12 @@ def create_parser() -> argparse.ArgumentParser:
         type=positive_float, default=1.0,
     )
     parser.add_argument(
+        "--init", choices=RESNET_INITS, default="kaiming",
+        help="ResNet weight init: 'kaiming' (fan_out normal, default) or "
+             "'default' (PyTorch layer defaults); only for resnet18/preactresnet18 "
+             "(cnn5layer and resnet18k always use PyTorch defaults)",
+    )
+    parser.add_argument(
         "--input-channels", "--input_channels", dest="input_channels",
         type=positive_int, default=None,
         help="Defaults to the dataset's native channel count; supported values: 1 or 3",
@@ -155,6 +162,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--checkpoint-interval", "--checkpoint_interval",
         dest="checkpoint_interval", type=nonnegative_int, default=1,
         help="Save every N epochs (default: 1); use 0 to disable checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint-model-only", "--checkpoint_model_only",
+        dest="checkpoint_model_only", action="store_true",
+        help="Save only model weights in checkpoints (omit optimizer state)",
     )
     parser.add_argument("--wandb-project", "--wandb_project", default="jonal")
     parser.add_argument("--wandb-entity", "--wandb_entity", default=None)
@@ -206,6 +218,9 @@ def generate_experiment_name(args: argparse.Namespace) -> str:
         f"bs-{args.batch_size}",
         f"opt-{args.optimizer}",
         f"width-{_number_token(args.model_width)}",
+        *(() if args.model not in ("resnet18", "preactresnet18")
+          or args.init == "kaiming"
+          else (f"init-{args.init}",)),
         f"ch-{args.input_channels}",
         f"aug-{_augmentation_token(args.augmentation)}",
         f"seed-{args.seed}",
@@ -282,12 +297,21 @@ def create_loss(name: str) -> nn.Module:
 
 
 class TrainingMetrics:
-    """Accumulate per-sample losses/errors for all, noisy, and clean samples."""
+    """Accumulate per-sample losses/errors for all, noisy, and clean samples.
+
+    Sums stay on the loss tensor's device and are read back once in
+    ``compute``, so ``update`` never blocks on the GPU. Each batch's subset
+    loss is the same float32 reduction as ``losses[mask].sum()`` and is added
+    to a float64 accumulator, which reproduces a per-batch Python-float
+    accumulation bit for bit.
+    """
+
+    SUBSETS = ("all", "noisy", "clean")
 
     def __init__(self) -> None:
-        self.counts = {"all": 0, "noisy": 0, "clean": 0}
-        self.loss_sums = {"all": 0.0, "noisy": 0.0, "clean": 0.0}
-        self.error_sums = {"all": 0, "noisy": 0, "clean": 0}
+        self.counts = dict.fromkeys(self.SUBSETS, 0)
+        self.loss_sums: dict[str, torch.Tensor] = {}
+        self.error_sums: dict[str, torch.Tensor] = {}
 
     def update(
         self,
@@ -296,39 +320,55 @@ class TrainingMetrics:
         training_labels: torch.Tensor,
         is_noisy: torch.Tensor,
     ) -> None:
+        """``is_noisy`` should be on the CPU: subset sizes and indices are
+        derived there, which keeps subset selection from synchronizing."""
+        device = losses.device
         errors = logits.argmax(dim=1).ne(training_labels)
-        masks = {
-            "all": torch.ones_like(is_noisy, dtype=torch.bool),
-            "noisy": is_noisy.bool(),
-            "clean": ~is_noisy.bool(),
+        noisy = is_noisy.cpu().bool()
+        subset_indices = {
+            "all": None,
+            "noisy": noisy.nonzero().squeeze(1),
+            "clean": (~noisy).nonzero().squeeze(1),
         }
-        for subset, mask in masks.items():
-            count = int(mask.sum().item())
+        for subset, indices in subset_indices.items():
+            if indices is None:
+                count = losses.numel()
+                subset_losses, subset_errors = losses, errors
+            else:
+                count = indices.numel()
+                if not count:
+                    continue
+                if device.type == "cuda":
+                    indices = indices.pin_memory()
+                indices = indices.to(device, non_blocking=True)
+                subset_losses = losses.index_select(0, indices)
+                subset_errors = errors.index_select(0, indices)
             self.counts[subset] += count
-            if count:
-                self.loss_sums[subset] += float(losses[mask].sum().item())
-                self.error_sums[subset] += int(errors[mask].sum().item())
+            loss_sum = subset_losses.sum().double()
+            error_sum = subset_errors.sum()
+            if subset in self.loss_sums:
+                self.loss_sums[subset] += loss_sum
+                self.error_sums[subset] += error_sum
+            else:
+                self.loss_sums[subset] = loss_sum
+                self.error_sums[subset] = error_sum
 
-    @staticmethod
-    def _average(total: float | int, count: int) -> float:
-        return float(total / count) if count else float("nan")
+    def _average(self, sums: dict[str, torch.Tensor], subset: str) -> float:
+        count = self.counts[subset]
+        if not count:
+            return float("nan")
+        return float(sums[subset].item() / count)
 
     def compute(self) -> dict[str, float]:
+        loss = {s: self._average(self.loss_sums, s) for s in self.SUBSETS}
+        error = {s: self._average(self.error_sums, s) for s in self.SUBSETS}
         return {
-            "train_error": self._average(self.error_sums["all"], self.counts["all"]),
-            "train_loss": self._average(self.loss_sums["all"], self.counts["all"]),
-            "train_error_noisy": self._average(
-                self.error_sums["noisy"], self.counts["noisy"]
-            ),
-            "train_loss_noisy": self._average(
-                self.loss_sums["noisy"], self.counts["noisy"]
-            ),
-            "train_error_clean": self._average(
-                self.error_sums["clean"], self.counts["clean"]
-            ),
-            "train_loss_clean": self._average(
-                self.loss_sums["clean"], self.counts["clean"]
-            ),
+            "train_error": error["all"],
+            "train_loss": loss["all"],
+            "train_error_noisy": error["noisy"],
+            "train_loss_noisy": loss["noisy"],
+            "train_error_clean": error["clean"],
+            "train_loss_clean": loss["clean"],
         }
 
 
@@ -344,7 +384,6 @@ def evaluate_training_metrics(
     for images, _original_labels, training_labels, is_noisy in loader:
         images = images.to(device, non_blocking=True)
         training_labels = training_labels.to(device, non_blocking=True)
-        is_noisy = is_noisy.to(device, non_blocking=True)
 
         logits = model(images)
         losses = criterion(logits, training_labels)
@@ -364,7 +403,6 @@ def train_one_epoch(
     for images, _original_labels, training_labels, is_noisy in loader:
         images = images.to(device, non_blocking=True)
         training_labels = training_labels.to(device, non_blocking=True)
-        is_noisy = is_noisy.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images)
@@ -384,20 +422,30 @@ def evaluate(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    # Sums stay on the device (float32 batch sum -> float64 accumulator) and
+    # are read back once, matching a per-batch Python-float accumulation.
     count = 0
-    loss_sum = 0.0
-    error_sum = 0
+    loss_sum: torch.Tensor | None = None
+    error_sum: torch.Tensor | None = None
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         logits = model(images)
         losses = criterion(logits, labels)
         count += labels.numel()
-        loss_sum += float(losses.sum().item())
-        error_sum += int(logits.argmax(dim=1).ne(labels).sum().item())
+        batch_loss = losses.sum().double()
+        batch_error = logits.argmax(dim=1).ne(labels).sum()
+        if loss_sum is None:
+            loss_sum, error_sum = batch_loss, batch_error
+        else:
+            loss_sum += batch_loss
+            error_sum += batch_error
     if not count:
         return {"test_error": float("nan"), "test_loss": float("nan")}
-    return {"test_error": error_sum / count, "test_loss": loss_sum / count}
+    return {
+        "test_error": int(error_sum.item()) / count,
+        "test_loss": float(loss_sum.item()) / count,
+    }
 
 
 def create_optimizer(
@@ -441,15 +489,14 @@ def save_checkpoint(
     checkpoint_directory = run_directory / "checkpoint"
     checkpoint_directory.mkdir(parents=True, exist_ok=True)
     path = checkpoint_directory / f"epoch_{epoch}.pt"
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": config,
-        },
-        path,
-    )
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "config": config,
+    }
+    if not config.get("checkpoint_model_only", False):
+        state["optimizer_state_dict"] = optimizer.state_dict()
+    torch.save(state, path)
     return path
 
 
@@ -522,6 +569,8 @@ def run_experiment(args: argparse.Namespace) -> Path:
     }
     if args.model == "cnn5layer":
         model_options["input_size"] = specification["input_size"]
+    elif args.model in ("resnet18", "preactresnet18"):
+        model_options["init"] = args.init
     model = create_model(args.model, **model_options).to(device)
     optimizer = create_optimizer(
         args.optimizer,
@@ -558,6 +607,9 @@ def run_experiment(args: argparse.Namespace) -> Path:
             f"{name}={initial_row[name]:.6g}" for name in METRIC_NAMES
         )
         print(f"epoch=0/init {initial_shown}", flush=True)
+        if args.checkpoint_interval > 0:
+            # The initial model is kept so analyses can start from epoch 0.
+            save_checkpoint(model, optimizer, config, run_directory, 0)
 
         for epoch in range(1, args.epochs + 1):
             train_metrics = train_one_epoch(

@@ -13,6 +13,7 @@ from numbers import Integral, Real
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 def _positive_int(name, value):
@@ -33,6 +34,29 @@ def _scaled_channels(width_multiplier, bases=(64, 128, 256, 512)):
             raise ValueError("width_multiplier must produce positive integer channels")
         channels.append(int(scaled))
     return channels
+
+
+RESNET_INITS = ("kaiming", "default")
+
+
+def _initialize_resnet(model, init):
+    """Apply ResNet weight initialization.
+
+    ``"kaiming"``: Conv2d weights use kaiming_normal_(fan_out, relu) as in
+    torchvision; BatchNorm uses weight=1, bias=0. ``"default"`` keeps the
+    PyTorch layer defaults (Conv2d/Linear: kaiming_uniform_(a=sqrt(5))).
+    The Linear classifier always keeps the PyTorch default.
+    """
+    if init == "default":
+        return
+    if init != "kaiming":
+        raise ValueError(f"init must be one of {RESNET_INITS}, got {init!r}")
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+        elif isinstance(module, nn.BatchNorm2d):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
 
 class CNN5Layer(nn.Module):
@@ -105,7 +129,8 @@ class ResNet18(nn.Module):
     Intended for 32x32 images; adaptive pooling also supports other sizes.
     """
 
-    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0):
+    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0,
+                 init="kaiming"):
         super().__init__()
         self.in_channels = _positive_int("in_channels", in_channels)
         num_classes = _positive_int("num_classes", num_classes)
@@ -120,12 +145,7 @@ class ResNet18(nn.Module):
         self.layer4 = self._stage(c3, c4, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(c4, num_classes)
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+        _initialize_resnet(self, init)
 
     @staticmethod
     def _stage(in_channels, out_channels, stride):
@@ -175,7 +195,8 @@ class PreActResNet18(nn.Module):
     Defaults to RGB 32x32 images and 10 classes; other spatial sizes work too.
     """
 
-    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0):
+    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0,
+                 init="kaiming"):
         super().__init__()
         self.in_channels = _positive_int("in_channels", in_channels)
         num_classes = _positive_int("num_classes", num_classes)
@@ -189,12 +210,7 @@ class PreActResNet18(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(c4, num_classes)
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(module, nn.BatchNorm2d):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+        _initialize_resnet(self, init)
 
     @staticmethod
     def _stage(in_channels, out_channels, stride):
@@ -211,8 +227,89 @@ class PreActResNet18(nn.Module):
         return self.fc(torch.flatten(self.avgpool(x), 1))
 
 
+class _ResNet18kBlock(nn.Module):
+    """PreActBlock of kuangliu/pytorch-cifar (as used by Nakkiran et al.)."""
+
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1,
+                          stride=stride, bias=False)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(x))
+        shortcut = self.shortcut(out) if hasattr(self, "shortcut") else x
+        out = self.conv1(out)
+        out = self.conv2(F.relu(self.bn2(out)))
+        out += shortcut
+        return out
+
+
+class ResNet18k(nn.Module):
+    """ResNet18 with width parameter k from Nakkiran et al., "Deep Double Descent".
+
+    A faithful port of their ``make_resnet18k`` (based on kuangliu/pytorch-cifar
+    ``preact_resnet.py``): channels [k, 2k, 4k, 8k], no BN/ReLU after the stem
+    or after layer4, ``avg_pool2d(4)`` and PyTorch default initialization.
+    Module names and construction order match the original, so state dicts are
+    interchangeable and the same seed gives the same initial weights.
+
+    Differences from the original: ``in_channels`` is configurable (the
+    original is fixed to 3), and k is given as ``width_multiplier = k / 64``
+    for consistency with the other models (k=64 is the standard ResNet18).
+    Expects 32x32 inputs (layer4 output 4x4).
+    """
+
+    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1.0):
+        super().__init__()
+        self.in_channels = _positive_int("in_channels", in_channels)
+        num_classes = _positive_int("num_classes", num_classes)
+        c = _scaled_channels(width_multiplier)[0]
+        self.in_planes = c
+        block = _ResNet18kBlock
+        self.conv1 = nn.Conv2d(self.in_channels, c, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.layer1 = self._make_layer(block, c, 2, stride=1)
+        self.layer2 = self._make_layer(block, 2 * c, 2, stride=2)
+        self.layer3 = self._make_layer(block, 4 * c, 2, stride=2)
+        self.layer4 = self._make_layer(block, 8 * c, 2, stride=2)
+        self.linear = nn.Linear(8 * c * block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(f"Expected [batch, {self.in_channels}, height, width], "
+                             f"got {tuple(x.shape)}")
+        out = self.conv1(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
 MODEL_REGISTRY = {"cnn5layer": CNN5Layer, "resnet18": ResNet18,
-                  "preactresnet18": PreActResNet18}
+                  "preactresnet18": PreActResNet18, "resnet18k": ResNet18k}
 
 
 def create_model(name, **kwargs):
@@ -222,4 +319,6 @@ def create_model(name, **kwargs):
     return MODEL_REGISTRY[name.lower()](**kwargs)
 
 
-__all__ = ["CNN5Layer", "ResNet18", "PreActResNet18", "create_model", "MODEL_REGISTRY"]
+__all__ = ["CNN5Layer", "ResNet18", "PreActResNet18", "ResNet18k", "create_model",
+           "MODEL_REGISTRY",
+           "RESNET_INITS"]

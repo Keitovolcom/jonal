@@ -145,8 +145,9 @@ interpolation/<experiment_name>/<mode>/
 └── metrics/
     ├── spatial_instability.csv / spatial_instability_per_pair.npz   # INST_S
     ├── temporal_instability.csv / temporal_instability.npz          # INST_T [epoch, α]
+    ├── temporal_instability_phase.csv / temporal_instability_phase.npz  # 学習区間ごとのINST_T [pair, 区間, α]
     ├── occupancy.csv                                                # original/noisy/other占有率
-    └── figures/{spatial_instability,temporal_instability_heatmap,occupancy}.pdf
+    └── figures/{spatial_instability,temporal_instability_heatmap,temporal_instability_phase,occupancy}.pdf
 ```
 
 `log.npz` には `probs`（[エポック, 201, クラス] のsoftmax確率、float32）、
@@ -155,3 +156,35 @@ interpolation/<experiment_name>/<mode>/
 完了済みの `log.npz` があるペアは再実行時にスキップされます。
 メモリ使用量は `--pairs-per-chunk`（既定100）で調整できます。
 INST_T の「t−1」は直前に評価したチェックポイントで、最初のエポックは `NaN` です。
+
+学習区間ごとの時間的不安定性 `INST_T(𝒯_k, x)` は、`--phase-epochs`（`PHASE_EPOCHS`）で
+区切った区間 `𝒯_k = {t : b_{k−1} < t ≤ b_k}` ごとに、補間直線上の各点 x（ペア×α）で
+Fl_T(t, x) を平均した値です（`[0,1]`）。区間の両端は評価した最初と最後のエポックで、
+`--phase-epochs` を省略すると全学習を1区間とします。CSVには全点での平均・標準偏差と、
+`0 ≤ α ≤ 1` だけでの平均を出力します。図 `temporal_instability_phase.{pdf,svg}` は区間ごとに1パネル
+（横軸α、縦軸はペア平均のINST_T、帯は±1標準偏差、凡例は `𝒯_AB=[0,27]` の形）で、
+x0・x1 の丸は noisy なら赤、clean なら青です。
+
+図 `spatial_instability.{pdf,svg}` は同じ体裁で、横軸エポック（symlog）、縦軸はペア平均の
+INST_S（補間直線上で隣接αの予測ラベルが変わる回数）、帯は±1標準偏差です。区間境界
+（最初のエポック・`--phase-epochs`・最後のエポック）を A, B, C, … と表示し、時間的不安定性の
+`𝒯_AB`, `𝒯_BC`, … と対応させています。`alpha_h5` のデータからは
+`python visualization/plot_spatial_h5.py` で `analysis_alpha/figs/spatial_instability/` に出力します。
+
+## CIFAR-10 model-wise double descent
+
+`train_cifar10_dd.bash` は Nakkiran et al. の `make_resnet18k` を移植した `resnet18k`
+（kuangliu/pytorch-cifar の PreActResNet18、最終BN+ReLUなし、PyTorch既定の初期化）の幅 k（チャネル `[k, 2k, 4k, 8k]`、
+`--model-width k/64`）を振り、Nakkiran et al. (2019) と同様の条件
+（Adam lr=1e-4・他はPyTorch既定、bs=128、20% ラベルノイズ、RandomCrop+Flip、1000 epoch）で学習します。
+`resnet18` / `preactresnet18` では `--init {kaiming,default}` で初期化を選べます（既定は従来どおり `kaiming`）。
+幅は大きい順にキューから取り出され、各GPUで `SLOTS_PER_GPU` 本ずつ並列に実行されます。
+
+```bash
+docker exec -d -w /workspace/jonal jonal-dev \
+  bash -c 'bash train_cifar10_dd.bash > logs/cifar10_dd.log 2>&1'
+# 例: GPUS="2 3" SLOTS_PER_GPU=3 WIDTHS="1 2 4 8 16 32 64" で変更可能
+```
+
+`--checkpoint-model-only` によりチェックポイントにはモデルの重みだけを保存します
+（optimizerの状態なし。k=64で1個約43MB、全23幅×1001個で約170GB）。

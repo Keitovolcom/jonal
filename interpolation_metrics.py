@@ -7,6 +7,9 @@ Reads ``interpolation/<experiment_name>/<mode>/pair_XXXX/log.npz`` written by
   on the interpolation line (Fig. 3).
 * INST_T(t, alpha): whether the prediction at alpha changed since the
   previously evaluated epoch, averaged over pairs (Fig. 4).
+* INST_T(T_k, x): for each training phase T_k (split at ``--phase-epochs``)
+  and each point x on the line, the fraction of epochs in T_k at which the
+  prediction at x changed since the previously evaluated epoch.
 * Occupancy: fraction of the line predicted as the original label, the noisy
   label (pairs containing a noisy sample) and any other label (Fig. 6).
 """
@@ -15,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import warnings
 from pathlib import Path
+from string import ascii_uppercase
 
 import numpy as np
 
@@ -45,6 +50,7 @@ def load_logs(mode_dir: Path) -> dict[str, np.ndarray]:
     if not paths:
         raise FileNotFoundError(f"no pair logs found under {mode_dir}")
     preds, original, noisy_label, pair_ids = [], [], [], []
+    x0_is_noisy, x1_is_noisy = [], []
     epochs = alphas = None
     for path in paths:
         with np.load(path) as log:
@@ -56,6 +62,8 @@ def load_logs(mode_dir: Path) -> dict[str, np.ndarray]:
             preds.append(log["preds"])
             pair_ids.append(int(log["pair_id"]))
             original.append(int(log["x0_original_label"]))
+            x0_is_noisy.append(bool(log["x0_is_noisy"]))
+            x1_is_noisy.append(bool(log["x1_is_noisy"]))
             # The noisy sample's training label, or -1 when the pair has none.
             if bool(log["x0_is_noisy"]):
                 noisy_label.append(int(log["x0_training_label"]))
@@ -70,6 +78,8 @@ def load_logs(mode_dir: Path) -> dict[str, np.ndarray]:
         "pair_ids": np.asarray(pair_ids),
         "original": np.asarray(original),
         "noisy_label": np.asarray(noisy_label),
+        "x0_is_noisy": np.asarray(x0_is_noisy),
+        "x1_is_noisy": np.asarray(x1_is_noisy),
     }
 
 
@@ -85,6 +95,37 @@ def temporal_instability(preds: np.ndarray) -> np.ndarray:
     flips = (preds[:, 1:] != preds[:, :-1]).mean(axis=0)
     first = np.full((1, preds.shape[-1]), np.nan)
     return np.concatenate([first, flips], axis=0)
+
+
+def phase_segments(epochs: np.ndarray, phase_epochs: list[float]) -> list[tuple[float, float]]:
+    """Training phases (start, end] split at the phase epochs inside the evaluated range."""
+
+    first, last = float(epochs[0]), float(epochs[-1])
+    edges = [first] + sorted({b for b in phase_epochs if first < b < last}) + [last]
+    return list(zip(edges[:-1], edges[1:]))
+
+
+def segmented_temporal_instability(
+    preds: np.ndarray, epochs: np.ndarray, segments: list[tuple[float, float]]
+) -> tuple[np.ndarray, np.ndarray]:
+    """INST_T(T_k, x) per pair, phase and alpha, [pairs, phases, alphas].
+
+    T_k holds the evaluated epochs t with start < t <= end, and Fl_T(t, x)
+    compares epoch t with the previously evaluated epoch, so the first epoch
+    is never in any T_k. Also returns |T_k| per phase.
+    """
+
+    flips = preds[:, 1:] != preds[:, :-1]      # [pairs, epochs - 1, alphas]
+    targets = np.asarray(epochs[1:], dtype=float)
+    values, sizes = [], []
+    for start, end in segments:
+        mask = (targets > start) & (targets <= end)
+        sizes.append(int(mask.sum()))
+        if mask.any():
+            values.append(flips[:, mask].mean(axis=1))
+        else:
+            values.append(np.full((preds.shape[0], preds.shape[-1]), np.nan))
+    return np.stack(values, axis=1), np.asarray(sizes)
 
 
 def label_occupancy(
@@ -106,7 +147,7 @@ def write_csv(path: Path, header: list[str], rows) -> None:
         writer.writerows(rows)
 
 
-def compute_metrics(mode_dir: Path) -> dict[str, np.ndarray]:
+def compute_metrics(mode_dir: Path, phase_epochs: list[float] = ()) -> dict[str, np.ndarray]:
     logs = load_logs(mode_dir)
     preds, epochs, alphas = logs["preds"], logs["epochs"], logs["alphas"]
     output_dir = mode_dir / "metrics"
@@ -134,6 +175,32 @@ def compute_metrics(mode_dir: Path) -> dict[str, np.ndarray]:
         zip(epochs, inst_t.mean(axis=1)),
     )
 
+    segments = phase_segments(epochs, list(phase_epochs))
+    inst_t_phase, phase_sizes = segmented_temporal_instability(preds, epochs, segments)
+    segment_array = np.asarray(segments, dtype=float)
+    np.savez(
+        output_dir / "temporal_instability_phase.npz",
+        inst_t_phase=inst_t_phase, segments=segment_array, num_epochs=phase_sizes,
+        alphas=alphas, pair_ids=logs["pair_ids"],
+    )
+    # Statistics over all points x (pairs x alphas) and over the interval
+    # between the two samples (0 <= alpha <= 1).
+    inner = (alphas >= 0) & (alphas <= 1)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        phase_rows = [
+            (start, end, size,
+             np.nanmean(values), np.nanstd(values), np.nanmean(values[:, inner]))
+            for (start, end), size, values in zip(
+                segments, phase_sizes, np.moveaxis(inst_t_phase, 1, 0))
+        ]
+    write_csv(
+        output_dir / "temporal_instability_phase.csv",
+        ["epoch_start", "epoch_end", "num_epochs",
+         "inst_t_mean", "inst_t_std", "inst_t_mean_alpha_0_1"],
+        phase_rows,
+    )
+
     occupancy = label_occupancy(preds, logs["original"], logs["noisy_label"])
     has_noisy = bool((logs["noisy_label"] >= 0).any())
     names = ["original", "noisy", "other"] if has_noisy else ["original", "other"]
@@ -148,6 +215,10 @@ def compute_metrics(mode_dir: Path) -> dict[str, np.ndarray]:
     print(f"{mode_dir}: {len(preds)} pairs, {len(epochs)} epochs -> {output_dir}", flush=True)
     return {
         "epochs": epochs, "alphas": alphas, "inst_s": inst_s, "inst_t": inst_t,
+        "inst_t_phase": inst_t_phase, "segments": segment_array,
+        # Endpoint drawn as noisy when most pairs have a noisy sample there.
+        "endpoint_noisy": np.array([logs["x0_is_noisy"].mean() > 0.5,
+                                    logs["x1_is_noisy"].mean() > 0.5]),
         **{f"occupancy_{name}": occupancy[name] for name in names},
     }
 
@@ -166,6 +237,132 @@ def _phase_lines(axis, phase_epochs: list[float], which: str = "x") -> None:
             axis.axhline(epoch, color="white", linewidth=0.8, linestyle="--")
 
 
+def phase_temporal_ylim(inst_t_phase: np.ndarray) -> tuple[float, float]:
+    """Y range of ``plot_phase_temporal_instability`` for these values.
+
+    The top is the highest mean + std band edge (clipped to 1) plus
+    matplotlib's default 5% margin; the bottom leaves room for the endpoint
+    markers at 0. Transition-type figures reuse it so both share one scale.
+    """
+
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean = np.nanmean(inst_t_phase, axis=0)   # [phases, alphas]
+        std = np.nanstd(inst_t_phase, axis=0)
+    top = 1.05 * np.nanmax(np.clip(mean + std, 0, 1))
+    return -0.02 * top, top
+
+
+def plot_phase_temporal_instability(
+    plt, figure_dir: Path, metrics: dict[str, np.ndarray],
+    ylim: tuple[float, float] | None = None, file_name: str = "temporal_instability_phase",
+) -> None:
+    """One panel per training phase: mean INST_T(T_k, x) over pairs vs alpha, +-1 std.
+
+    Phases are named by consecutive letters at their boundaries (T_AB, T_BC, ...)
+    and labelled with the evaluated epoch range [start, end] they use. Endpoint
+    markers are red for a noisy sample and blue for a clean one.
+    """
+
+    alphas, segments = metrics["alphas"], metrics["segments"]
+    inst_t_phase = metrics["inst_t_phase"]
+    endpoint_colors = ["red" if noisy else "blue" for noisy in metrics["endpoint_noisy"]]
+    num_phases = len(segments)
+
+    with plt.rc_context({"font.size": 23, "font.family": "DejaVu Sans"}):
+        figure, axes = plt.subplots(
+            1, num_phases, figsize=(6 * num_phases, 5.5), sharey=True, dpi=300, squeeze=False
+        )
+        axes = axes[0]
+        for k, (axis, (start, end), values) in enumerate(
+            zip(axes, segments, np.moveaxis(inst_t_phase, 1, 0))
+        ):
+            if np.isnan(values).all():
+                axis.text(0.5, 0.5, "No Data", ha="center", va="center",
+                          transform=axis.transAxes)
+                continue
+            mean, std = np.nanmean(values, axis=0), np.nanstd(values, axis=0)
+            axis.plot(alphas, mean, linewidth=2, zorder=3, color="blue",
+                      label=r"$INST_{\mathrm{T}}(\mathcal{T},x)$")
+            # INST_T lies in [0, 1], so the band is clipped to that range.
+            axis.fill_between(alphas, np.clip(mean - std, 0, 1), np.clip(mean + std, 0, 1),
+                              alpha=0.2, zorder=2, color="blue", linewidth=0)
+            name = ascii_uppercase[k % 26] + ascii_uppercase[(k + 1) % 26]
+            axis.plot([], [], linewidth=0,
+                      label=rf"$\mathcal{{T}}_{{{name}}}$=[{start:g},{end:g}]")
+            for alpha, color in zip((0.0, 1.0), endpoint_colors):
+                axis.axvline(alpha, color="black", linestyle="-", linewidth=2, zorder=1.8)  # above the grid
+                axis.plot(alpha, 0.0, "o", color=color, markersize=15, zorder=5,
+                          clip_on=False)
+            axis.set_xticks([0.0, 1.0])
+            axis.set_xticklabels([r"$x_{0}$", r"$x_{1}$"], fontsize=30)
+            if num_phases > 1:  # a single phase (no label noise) needs no legend
+                axis.legend()
+            axis.grid(True)
+        axes[0].set_ylabel("Temporal Instability")
+        # Shared with the transition-type figures; leaves room for the markers at 0.
+        # ``ylim`` overrides it, e.g. to draw clean pairs on a clean-noisy scale.
+        axes[0].set_ylim(*(phase_temporal_ylim(inst_t_phase) if ylim is None else ylim))
+        # Fix every panel to the same size in inches, so a single-phase figure
+        # (label noise 0.0) looks like one panel of the multi-phase figure
+        # instead of a narrow panel squeezed by the y label and tick labels.
+        # The single panel is ~10% wider.
+        panel_width, panel_height = (5.3 if num_phases > 1 else 5.8), 4.2
+        figure.tight_layout()
+        for _ in range(3):
+            width, height = figure.get_size_inches()
+            box = axes[0].get_position()
+            figure.set_size_inches(width + num_phases * (panel_width - box.width * width),
+                                   height + (panel_height - box.height * height))
+            figure.tight_layout()
+        for suffix in ("pdf", "svg"):
+            figure.savefig(figure_dir / f"{file_name}.{suffix}")
+        plt.close(figure)
+
+
+def plot_spatial_instability(
+    plt, figure_dir: Path, metrics: dict[str, np.ndarray], phase_epochs=()
+) -> None:
+    """Mean INST_S(t) over pairs vs epoch with a +-1 std band.
+
+    Same style as ``plot_phase_temporal_instability``. The phase boundaries
+    (first epoch, ``phase_epochs``, last epoch) are lettered A, B, C, ... so
+    they match the T_AB, T_BC, ... phases of the temporal figure.
+    """
+
+    from matplotlib.transforms import blended_transform_factory
+
+    epochs = np.asarray(metrics["epochs"], dtype=float)
+    inst_s = metrics["inst_s"]
+    mean, std = inst_s.mean(axis=0), inst_s.std(axis=0)
+    edges = [start for start, _ in phase_segments(epochs, list(phase_epochs))] + [epochs[-1]]
+
+    with plt.rc_context({"font.size": 23, "font.family": "DejaVu Sans"}):
+        figure, axis = plt.subplots(figsize=(12, 6), dpi=300)
+        axis.plot(epochs, mean, linewidth=2, zorder=3, color="blue",
+                  label=r"$INST_{\mathrm{S}}(t)$")
+        # INST_S is a count of label changes, so the band stops at 0.
+        axis.fill_between(epochs, np.clip(mean - std, 0, None), mean + std,
+                          alpha=0.2, zorder=2, color="blue", linewidth=0)
+        _epoch_axis(axis, epochs)
+        axis.set_xlim(epochs[0], epochs[-1])
+        label_transform = blended_transform_factory(axis.transData, axis.transAxes)
+        for k, edge in enumerate(edges):
+            if epochs[0] < edge < epochs[-1]:
+                axis.axvline(edge, color="black", linestyle="--", linewidth=2, zorder=1.8)
+            axis.text(edge, 1.02, ascii_uppercase[k % 26], transform=label_transform,
+                      ha="center", va="bottom")
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Spatial Instability")
+        axis.set_ylim(bottom=0)
+        axis.legend()
+        axis.grid(True)
+        figure.tight_layout()
+        for suffix in ("pdf", "svg"):
+            figure.savefig(figure_dir / f"spatial_instability.{suffix}")
+        plt.close(figure)
+
+
 def plot_metrics(mode_dir: Path, metrics: dict[str, np.ndarray], phase_epochs) -> None:
     import matplotlib
 
@@ -177,18 +374,7 @@ def plot_metrics(mode_dir: Path, metrics: dict[str, np.ndarray], phase_epochs) -
     mode = mode_dir.name
     epochs, alphas = metrics["epochs"], metrics["alphas"]
 
-    figure, axis = plt.subplots(figsize=(5, 3))
-    mean, std = metrics["inst_s"].mean(axis=0), metrics["inst_s"].std(axis=0)
-    axis.plot(epochs, mean, color="#1f3fbf", linewidth=1)
-    axis.fill_between(epochs, mean - std, mean + std, color="#1f3fbf", alpha=0.25, linewidth=0)
-    _epoch_axis(axis, epochs)
-    _phase_lines(axis, phase_epochs)
-    axis.set(xlabel="epoch", ylabel="spatial instability", title=mode)
-    axis.set_ylim(bottom=0)
-    axis.grid(alpha=0.3)
-    figure.tight_layout()
-    figure.savefig(figure_dir / "spatial_instability.pdf")
-    plt.close(figure)
+    plot_spatial_instability(plt, figure_dir, metrics, phase_epochs)
 
     if len(epochs) > 1:
         figure, axis = plt.subplots(figsize=(4, 4))
@@ -204,6 +390,9 @@ def plot_metrics(mode_dir: Path, metrics: dict[str, np.ndarray], phase_epochs) -
         figure.tight_layout()
         figure.savefig(figure_dir / "temporal_instability_heatmap.pdf")
         plt.close(figure)
+
+    if len(epochs) > 1:
+        plot_phase_temporal_instability(plt, figure_dir, metrics)
 
     figure, axis = plt.subplots(figsize=(5, 3))
     colors = {"original": "#1f3fbf", "noisy": "#d62728", "other": "#2ca02c"}
@@ -226,7 +415,7 @@ def plot_metrics(mode_dir: Path, metrics: dict[str, np.ndarray], phase_epochs) -
 def main(argv: list[str] | None = None) -> None:
     args = create_parser().parse_args(argv)
     for mode_dir in args.mode_dirs:
-        metrics = compute_metrics(mode_dir)
+        metrics = compute_metrics(mode_dir, args.phase_epochs)
         if not args.no_plot:
             plot_metrics(mode_dir, metrics, args.phase_epochs)
 

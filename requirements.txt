@@ -6,3 +6,4 @@ scikit-learn
 opencv-python
 einops
 tqdm
+h5py

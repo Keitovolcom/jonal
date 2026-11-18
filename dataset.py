@@ -24,6 +24,7 @@ _ALIASES = {
     "emnist-digits": "emnist-digits",
     "emnist_digits": "emnist-digits",
     "emnistdigits": "emnist-digits",
+    "mnist": "mnist",
 }
 
 _CONFIG = {
@@ -41,6 +42,11 @@ _CONFIG = {
         "num_classes": 10,
         "mean": (0.173469787916794,),
         "std": (0.316553955125998,),
+    },
+    "mnist": {
+        "num_classes": 10,
+        "mean": (0.1306604762738429,),
+        "std": (0.3081078038564622,),
     },
 }
 
@@ -144,6 +150,7 @@ _DEFAULT_AUGMENTATIONS = {
     "cifar10": ("random_crop", "horizontal_flip"),
     "cifar100": ("random_crop", "horizontal_flip"),
     "emnist-digits": ("random_affine",),
+    "mnist": ("random_affine",),
 }
 
 _SHORT_ARGUMENTS = {
@@ -269,7 +276,7 @@ def _create_augmentation(
         if name == "color_jitter":
             if not parameters:
                 kwargs = {"brightness": 0.2, "contrast": 0.2}
-                if dataset_name != "emnist-digits":
+                if dataset_name not in ("emnist-digits", "mnist"):
                     kwargs["saturation"] = 0.2
             return transforms.ColorJitter(**kwargs)
         if name == "random_perspective":
@@ -524,7 +531,8 @@ def load_dataset(
 ):
     """Load and return ``(train_dataset, evaluation_dataset)``.
 
-    Supported names are ``cifar10``, ``cifar100`` and ``emnist-digits``.
+    Supported names are ``cifar10``, ``cifar100``, ``emnist-digits`` and ``mnist``.
+    MNIST keeps its native 28x28 size; EMNIST-digits is resized to 32x32.
     Noise is applied only to the training split. A zero rate creates no cache.
     """
 
@@ -547,6 +555,15 @@ def load_dataset(
         evaluation_dataset = datasets.EMNIST(
             root=dataset_root, split="digits", train=False,
             download=download, transform=evaluation_transform,
+        )
+    elif name == "mnist":
+        train_dataset = datasets.MNIST(
+            root=dataset_root, train=True, download=download,
+            transform=train_transform,
+        )
+        evaluation_dataset = datasets.MNIST(
+            root=dataset_root, train=False, download=download,
+            transform=evaluation_transform,
         )
     else:
         dataset_class = datasets.CIFAR10 if name == "cifar10" else datasets.CIFAR100

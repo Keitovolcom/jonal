@@ -2,3 +2,9 @@ data/
 results/
 ._pycache_/
 interpolation/
+alpha_h5/
+analysis_alpha/
+paper/
+logs/
+__pycache__/
+*.pyc

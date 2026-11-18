@@ -1,189 +1,140 @@
-"""Plot the CNN5Layer width sweep as a 5-by-4 metrics grid."""
+"""Plot model-wise double descent: final metrics vs. model width for a width-sweep.
+
+Each run directory under the sweep is expected to contain ``config.json`` and
+``metrics.csv``. Per run, the row at ``--epoch`` (default: the last epoch) is taken;
+x is the resnet18k width parameter k = model_width * 64. Panel layout and style
+follow ``plot_learning_curve.py`` (error / noisy-clean error / loss).
+
+    python visualization/plot_width_sweep.py [--sweep-dir results/<sweep>] [--out OUTPUT_BASE]
+
+OUTPUT_BASE has no extension; ``.png`` and ``.pdf`` are written next to each other.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from plot_learning_curve import PanelConfig, SeriesSpec, plot_panels  # noqa: E402
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SWEEP_DIR = (
-    PROJECT_ROOT / "results" / "cnn5layer-width-sweep-20260909T010104Z"
-)
-DEFAULT_WIDTH_ONE_DIR = PROJECT_ROOT / "results" / (
-    "emnist-digits_cnn5layer_noise-0p2_lr-0p01_loss-crossentropy_bs-256_"
-    "opt-sgd_width-1_ch-1_aug-none_seed-42"
-)
-DEFAULT_OUTPUT = DEFAULT_SWEEP_DIR / "width_sweep_metrics.pdf"
-
-COLORS = {
-    "test": "#d62728",   # red
-    "train": "#1f77b4",  # blue
-    "clean": "#2ca02c",  # green
-    "noisy": "#9467bd",  # purple
-}
-ERROR_Y_LIMITS = (-0.01, 1.01)
-LOSS_Y_LIMITS = (-0.01, 5.01)
+ROOT = Path(__file__).resolve().parents[1]
+SWEEP_DIR = ROOT / "results/cifar10-dd-resnet18k-width-sweep-20261113T140649Z"
+BASE_WIDTH = 64  # resnet18k: --model-width = k / 64
 
 
-@dataclass(frozen=True)
-class Run:
-    width: float
-    directory: Path
-    metrics: pd.DataFrame
-
-
-def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Plot four CNN5Layer widths in a 5-row metrics grid."
-    )
-    parser.add_argument(
-        "--sweep-dir",
-        type=Path,
-        default=DEFAULT_SWEEP_DIR,
-        help="Directory containing the width-sweep run directories.",
-    )
-    parser.add_argument(
-        "--width-one-dir",
-        type=Path,
-        default=DEFAULT_WIDTH_ONE_DIR,
-        help="Run directory for width=1.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Output image path (format is inferred from the suffix).",
-    )
-    parser.add_argument("--dpi", type=int, default=200)
-    return parser
-
-
-def load_run(directory: Path) -> Run:
-    config_path = directory / "config.json"
-    metrics_path = directory / "metrics.csv"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"config not found: {config_path}")
-    if not metrics_path.is_file():
-        raise FileNotFoundError(f"metrics not found: {metrics_path}")
-
-    with config_path.open(encoding="utf-8") as file:
-        config = json.load(file)
-    try:
-        width = float(config["model_width"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid model_width in {config_path}") from exc
-
-    metrics = pd.read_csv(metrics_path)
-    required_columns = {
-        "epoch",
-        "test_error",
-        "train_error",
-        "train_error_clean",
-        "train_error_noisy",
-        "test_loss",
-        "train_loss",
-    }
-    missing = required_columns.difference(metrics.columns)
-    if missing:
-        raise ValueError(
-            f"missing columns in {metrics_path}: {', '.join(sorted(missing))}"
-        )
-
-    # A logarithmic x-axis cannot represent epoch 0.
-    metrics = metrics.loc[metrics["epoch"] > 0].sort_values("epoch")
-    if metrics.empty:
-        raise ValueError(f"no positive epochs found in {metrics_path}")
-    return Run(width=width, directory=directory, metrics=metrics)
-
-
-def collect_runs(sweep_dir: Path, width_one_dir: Path) -> list[Run]:
-    run_directories = sorted(path.parent for path in sweep_dir.glob("*/metrics.csv"))
-    run_directories.append(width_one_dir)
-    runs = sorted((load_run(path) for path in run_directories), key=lambda run: run.width)
-
-    if len(runs) != 4:
-        raise ValueError(f"expected exactly 4 runs, found {len(runs)}")
-    widths = [run.width for run in runs]
-    if len(set(widths)) != len(widths):
-        raise ValueError(f"duplicate widths found: {widths}")
-    return runs
-
-
-def plot_runs(runs: list[Run], output: Path, dpi: int) -> None:
-    row_specs = (
-        ("Test error", (("test_error", "Test", COLORS["test"]),)),
-        ("Train error", (("train_error", "Train", COLORS["train"]),)),
-        (
-            "Train clean error",
-            (("train_error_clean", "Clean", COLORS["clean"]),),
-        ),
-        (
-            "Train noisy error",
-            (("train_error_noisy", "Noisy", COLORS["noisy"]),),
-        ),
-        (
-            "Loss",
-            (
-                ("test_loss", "Test", COLORS["test"]),
-                ("train_loss", "Train", COLORS["train"]),
-            ),
-        ),
-    )
-
-    figure, axes = plt.subplots(
-        nrows=5,
-        ncols=4,
-        figsize=(16, 14),
-        sharex=True,
-        sharey="row",
-        constrained_layout=True,
-    )
-
-    for column, run in enumerate(runs):
-        axes[0, column].set_title(f"width = {run.width:g}", fontsize=13)
-        for row, (row_label, series) in enumerate(row_specs):
-            axis = axes[row, column]
-            for metric, label, color in series:
-                axis.plot(
-                    run.metrics["epoch"],
-                    run.metrics[metric],
-                    color=color,
-                    linewidth=1.35,
-                    label=label,
-                )
-            axis.set_xscale("log")
-            axis.set_ylim(*(LOSS_Y_LIMITS if row == 4 else ERROR_Y_LIMITS))
-            axis.grid(True, which="major", color="0.85", linewidth=0.7)
-            axis.grid(True, which="minor", color="0.92", linewidth=0.5)
-            if column == 0:
-                axis.set_ylabel(row_label)
-            if row == len(row_specs) - 1:
-                axis.set_xlabel("Epoch (log scale)")
-            if row == len(row_specs) - 1:
-                axis.legend(loc="upper right", frameon=True, fontsize=8)
-
-    min_epoch = min(run.metrics["epoch"].min() for run in runs)
-    max_epoch = max(run.metrics["epoch"].max() for run in runs)
-    for axis in axes.flat:
-        axis.set_xlim(min_epoch, max_epoch)
-
-    figure.suptitle("CNN5Layer width sweep (EMNIST Digits, 20% label noise)")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output, dpi=dpi, bbox_inches="tight")
-    plt.close(figure)
+def load_sweep(sweep_dir: Path, epoch: Optional[int]) -> pd.DataFrame:
+    rows = []
+    for run in sorted(p for p in sweep_dir.iterdir() if (p / "metrics.csv").is_file()):
+        cfg = json.loads((run / "config.json").read_text())
+        metrics = pd.read_csv(run / "metrics.csv")
+        target = metrics["epoch"].max() if epoch is None else epoch
+        row = metrics[metrics["epoch"] == target]
+        if row.empty:
+            print(f"[!] skip {run.name}: epoch {target} not found (last={metrics['epoch'].max()})")
+            continue
+        row = row.iloc[-1].to_dict()
+        row["width"] = round(cfg["model_width"] * BASE_WIDTH, 6)
+        rows.append(row)
+    if not rows:
+        raise SystemExit(f"no runs found under {sweep_dir}")
+    df = pd.DataFrame(rows).sort_values("width").reset_index(drop=True)
+    if df["epoch"].nunique() > 1:
+        print(f"[!] runs are at different epochs: {sorted(df['epoch'].unique())}")
+    return df
 
 
 def main() -> None:
-    args = create_parser().parse_args()
-    runs = collect_runs(args.sweep_dir, args.width_one_dir)
-    plot_runs(runs, args.output, args.dpi)
-    print(f"Saved plot to {args.output}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sweep-dir", type=Path, default=SWEEP_DIR)
+    parser.add_argument("--out", type=Path, default=None,
+                        help="output path without extension (default: <sweep-dir>/viz/width_sweep_epoch-<E>)")
+    parser.add_argument("--epoch", type=int, default=None, help="epoch to read (default: last epoch of each run)")
+    parser.add_argument("--xscale", choices=["log", "linear"], default="log")
+    parser.add_argument("--vlines", type=float, nargs="*", default=[], help="widths to mark with dotted lines")
+    parser.add_argument("--csv-out", action="store_true", help="also write the collected table as CSV")
+    args = parser.parse_args()
+
+    df = load_sweep(args.sweep_dir, args.epoch)
+    epoch_label = int(df["epoch"].max())
+    out = args.out or args.sweep_dir / "viz" / f"width_sweep_epoch-{epoch_label}"
+
+    marker = dict(marker="o", markersize=10)
+    panels = [
+        PanelConfig(
+            series=(
+                SeriesSpec("test_error", "test", color="red", linewidth=3, **marker),
+                SeriesSpec("train_error", "train", color="blue", linewidth=3, **marker),
+            ),
+            ylabel="error",
+            ylim=(0.0, None),  # upper limit from data
+            grid=True,
+            grid_axis="y",
+            hide_x_ticks=True,
+            tick_labelsize=35,
+            legend_fontsize=35,
+        ),
+        PanelConfig(
+            series=(
+                SeriesSpec("train_error_noisy", "noisy", color="purple", linestyle="--", linewidth=3, **marker),
+            ),
+            twin_series=(
+                SeriesSpec("train_error_clean", "clean", color="green", linewidth=3, **marker),
+            ),
+            ylabel="train noisy error",
+            yticks=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            ylim=(0.0, 1.01),
+            twin_ylabel="train clean error",
+            twin_ylim=(0.0, None),  # upper limit from data
+            hide_x_ticks=True,
+            grid=True,
+            grid_axis="y",
+            tick_labelsize=35,
+            twin_tick_labelsize=35,
+            legend_fontsize=35,
+        ),
+        PanelConfig(
+            series=(
+                SeriesSpec("test_loss", "test loss", color="red", linewidth=3, **marker),
+                SeriesSpec("train_loss", "train loss", color="blue", linewidth=3, **marker),
+            ),
+            ylabel="loss",
+            xlabel="width $k$",
+            grid=True,
+            grid_axis="y",
+            ylim=(0.0, None),  # upper limit from data
+            ytick_format="%.1f",
+            tick_labelsize=35,
+            legend_fontsize=35,
+        ),
+    ]
+    xlim = (df["width"].min(), df["width"].max())
+    if args.xscale == "linear":
+        xlim = (0, xlim[1])
+    xticks = [k for k in (1, 2, 4, 8, 16, 32, 64) if xlim[0] <= k <= xlim[1]] if args.xscale == "log" else None
+    panels = [replace(p, xscale=args.xscale, xlim=xlim, xticks=xticks) for p in panels]
+
+    saved = plot_panels(
+        df,
+        panels,
+        out,
+        vertical_lines=args.vlines,
+        figure_size=(13, 18),
+        font_family="Times New Roman",
+        font_size=35,
+        x="width",
+    )
+    if args.csv_out:
+        csv_path = Path(out).with_name(f"{Path(out).name}.csv")
+        df.to_csv(csv_path, index=False)
+        saved.append(str(csv_path))
+    print(f"[✓] Saved: {', '.join(saved)}")
 
 
 if __name__ == "__main__":
