@@ -28,7 +28,7 @@ data_augmentation={
 }
 ```
 
-`data_augmentation=True`では従来どおり、CIFARに`random_crop + horizontal_flip`、EMNIST-digitsに`random_affine`を適用します。`False`または`None`では追加の拡張を行いません。
+`data_augmentation=True`では、CIFARに`random_crop + horizontal_flip`を適用します。`False`または`None`では追加の拡張を行いません。EMNIST-digitsはデータ拡張なし（`False`、`train.py`では`--augmentation none`）で使用します。
 
 指定可能な種類: `random_crop`、`horizontal_flip`、`vertical_flip`、`random_rotation`、`random_affine`、`color_jitter`、`random_perspective`、`random_resized_crop`、`random_grayscale`、`gaussian_blur`、`random_erasing`。
 
